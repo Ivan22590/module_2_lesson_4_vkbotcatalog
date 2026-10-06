@@ -28,6 +28,9 @@ logger = logging.getLogger("bot")
 
 MAX_MESSAGE_LENGTH = 4096  # ограничение ВКонтакте на длину сообщения
 RECONNECT_DELAY = 5  # пауза перед переподключением к Long Poll, сек
+TRANSIENT_RETRY_DELAY = 1  # пауза перед повтором того же запроса Long Poll, сек
+LONGPOLL_MAX_FAILURES = 5  # ошибок подряд до пересоздания Long Poll
+SEND_ATTEMPTS = 2  # попыток отправки одной части сообщения при сетевом сбое
 FATAL_API_CODES = frozenset({5, 15})  # неверный токен / нет доступа
 CHAT_BOT_FEATURE_CODE = 912  # в сообществе отключены «Возможности ботов»
 CHAT_BOT_FEATURE_HINT = (
@@ -101,26 +104,72 @@ def send_message(
     peer_id: int,
     text: str,
     keyboard: vk_api.keyboard.VkKeyboard,
-) -> None:
+) -> list[int]:
     """Отправляет сообщение пользователю с клавиатурой.
 
     Длинные тексты разбиваются на части, каждая отправляется отдельным
     сообщением с обязательным параметром ``random_id``.
 
     :param vk: объект API ВКонтакте;
-    :param id получателя;
+    :param peer_id: id получателя;
     :param text: текст сообщения;
     :param keyboard: клавиатура сообщения;
+    :return: идентификаторы отправленных сообщений;
     :raises vk_api.exceptions.ApiError: при ошибке VK API.
     """
     keyboard_json = keyboard.get_keyboard()
-    for chunk in split_message(text):
-        vk.messages.send(
-            peer_id=peer_id,
-            message=chunk,
-            random_id=get_random_id(),
-            keyboard=keyboard_json,
-        )
+    return [
+        _send_chunk(vk, peer_id, chunk, keyboard_json)
+        for chunk in split_message(text)
+    ]
+
+
+def _send_chunk(
+    vk: vk_api.VkApiMethod,
+    peer_id: int,
+    chunk: str,
+    keyboard_json: str,
+    attempts: int = SEND_ATTEMPTS,
+) -> int:
+    """Отправляет одну часть сообщения, повторяя запрос при сетевом сбое.
+
+    Повтор использует тот же ``random_id``: если запрос дошел до ВКонтакте,
+    а ответ потерялся, дубликат сообщения не будет создан. Ошибки самого
+    VK API не повторяются — повтор их не исправит.
+
+    :param vk: объект API ВКонтакте;
+    :param peer_id: id получателя;
+    :param chunk: текст одной части сообщения;
+    :param keyboard_json: JSON клавиатуры;
+    :param attempts: максимальное число попыток;
+    :return: идентификатор сообщения;
+    :raises vk_api.exceptions.ApiError: при ошибке VK API;
+    :raises Exception: если все попытки сорвались по сети.
+    """
+    random_id = get_random_id()
+    for attempt in range(1, attempts + 1):
+        try:
+            return vk.messages.send(
+                peer_id=peer_id,
+                message=chunk,
+                random_id=random_id,
+                keyboard=keyboard_json,
+            )
+        except (ApiError, VkApiError):
+            raise
+        except Exception as exc:
+            if attempt >= attempts:
+                raise
+            logger.warning(
+                "Сбой отправки peer_id=%s (попытка %s из %s): %s, повторяю через 1 с",
+                peer_id,
+                attempt,
+                attempts,
+                exc,
+            )
+            time.sleep(1)
+
+    raise RuntimeError(f"Не удалось отправить сообщение peer_id={peer_id}")
 
 
 def parse_payload(message: dict[str, Any]) -> dict[str, Any] | None:
@@ -176,7 +225,7 @@ def handle_event(vk: vk_api.VkApiMethod, event: Any) -> None:
     reply_text, keyboard = _safe_reply(text, payload)
 
     try:
-        send_message(vk, peer_id, reply_text, keyboard)
+        message_ids = send_message(vk, peer_id, reply_text, keyboard)
     except ApiError as exc:
         logger.error("Не удалось отправить сообщение peer_id=%s: %s", peer_id, exc)
         if exc.code == CHAT_BOT_FEATURE_CODE:
@@ -186,6 +235,13 @@ def handle_event(vk: vk_api.VkApiMethod, event: Any) -> None:
         _try_send_error_notice(vk, peer_id)
     except VkApiError:
         logger.exception("Сетевая ошибка при отправке peer_id=%s", peer_id)
+    except Exception as exc:
+        # Ошибка не должна выходить из handle_event: иначе цикл Long Poll
+        # прервется, бот переподключится с новым ts и потеряет события,
+        # накопленные на сервере ВКонтакте.
+        logger.exception("Непредвиденная ошибка при отправке peer_id=%s: %s", peer_id, exc)
+    else:
+        logger.info("Ответ отправлен peer_id=%s, message_id=%s", peer_id, message_ids)
 
 
 def _safe_reply(
@@ -219,7 +275,14 @@ def _try_send_error_notice(vk: vk_api.VkApiMethod, peer_id: int) -> None:
 def run_bot(config: Config) -> int:
     """Создает сессию, определяет ID сообщества и запускает цикл Long Poll.
 
-    При обрыве соединения бот переподключается с паузой.
+    Ошибки сети при опросе Long Poll **не** приводят к пересозданию
+    соединения: бот повторяет запрос с тем же ``ts``, чтобы не потерять
+    уже накопленные на сервере ВКонтакте события. Раньше любая сетевая
+    ошибка обрывала цикл, создавался новый Long Poll со свежим ``ts``
+    и несколько подряд отправленных сообщений «терялись» — бот молчал.
+
+    Соединение пересоздается только после ``LONGPOLL_MAX_FAILURES``
+    ошибок подряд или при ошибке самого VK API.
 
     :param config: конфигурация бота;
     :return: код завершения процесса.
@@ -240,33 +303,95 @@ def run_bot(config: Config) -> int:
     vk = session.get_api()
     logger.info("Бот запускается, group_id=%s", group_id)
 
-    while True:
-        try:
-            longpoll = VkBotLongPoll(session, group_id)
-            logger.info("Long Poll запущен, ожидание сообщений...")
-            for event in longpoll.listen():
-                handle_event(vk, event)
-        except KeyboardInterrupt:
-            logger.info("Бот остановлен пользователем.")
-            return 0
-        except ApiError as exc:
-            if exc.code in FATAL_API_CODES:
+    longpoll: VkBotLongPoll | None = None
+    failures = 0
+
+    try:
+        while True:
+            if longpoll is None:
+                try:
+                    longpoll = VkBotLongPoll(session, group_id)
+                except ApiError as exc:
+                    if exc.code in FATAL_API_CODES:
+                        logger.error(
+                            "Нет доступа к API: %s. Проверьте токен в .env и настройки "
+                            "сообщества (сообщения и Long Poll должны быть включены).",
+                            exc,
+                        )
+                        return 1
+                    logger.error(
+                        "Не удалось получить сервер Long Poll: %s. Повтор через %s с",
+                        exc,
+                        RECONNECT_DELAY,
+                    )
+                    time.sleep(RECONNECT_DELAY)
+                    continue
+                except Exception as exc:
+                    logger.error(
+                        "Ошибка подключения к Long Poll: %s. Повтор через %s с",
+                        exc,
+                        RECONNECT_DELAY,
+                    )
+                    time.sleep(RECONNECT_DELAY)
+                    continue
+                failures = 0
+                logger.info("Long Poll запущен, ожидание сообщений...")
+
+            try:
+                events = longpoll.check()
+            except ApiError as exc:
+                if exc.code in FATAL_API_CODES:
+                    logger.error(
+                        "Нет доступа к API: %s. Проверьте токен в .env и настройки "
+                        "сообщества (сообщения и Long Poll должны быть включены).",
+                        exc,
+                    )
+                    return 1
                 logger.error(
-                    "Нет доступа к API: %s. Проверьте токен в .env и настройки "
-                    "сообщества (сообщения и Long Poll должны быть включены).",
+                    "Ошибка VK API при опросе Long Poll: %s. Переподключение через %s с",
                     exc,
+                    RECONNECT_DELAY,
                 )
-                return 1
-            logger.error("Ошибка VK API: %s. Переподключение через %s с", exc, RECONNECT_DELAY)
-            time.sleep(RECONNECT_DELAY)
-        except VkApiError:
-            logger.exception(
-                "Сетевая ошибка Long Poll, переподключение через %s с", RECONNECT_DELAY
-            )
-            time.sleep(RECONNECT_DELAY)
-        except Exception:
-            logger.exception("Непредвиденная ошибка, переподключение через %s с", RECONNECT_DELAY)
-            time.sleep(RECONNECT_DELAY)
+                longpoll = None
+                time.sleep(RECONNECT_DELAY)
+                continue
+            except Exception as exc:
+                # Сетевая ошибка или мусорный ответ вместо JSON: повторяем
+                # тот же запрос с тем же ts — события при этом не теряются.
+                failures += 1
+                if failures >= LONGPOLL_MAX_FAILURES:
+                    logger.warning(
+                        "Long Poll не отвечает %s раз подряд (%s) — создаю соединение "
+                        "заново, события за паузу могут быть потеряны",
+                        failures,
+                        exc,
+                    )
+                    longpoll = None
+                    time.sleep(RECONNECT_DELAY)
+                else:
+                    logger.warning(
+                        "Сбой ожидания Long Poll (%s из %s): %s. Повтор через %s с "
+                        "с тем же ts",
+                        failures,
+                        LONGPOLL_MAX_FAILURES,
+                        exc,
+                        TRANSIENT_RETRY_DELAY,
+                    )
+                    time.sleep(TRANSIENT_RETRY_DELAY)
+                continue
+
+            failures = 0
+            for event in events:
+                try:
+                    handle_event(vk, event)
+                except Exception as exc:
+                    # Одно сообщение не должно ронять обработку остальных
+                    logger.exception(
+                        "Ошибка обработки события, бот продолжает работу: %s", exc
+                    )
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем.")
+        return 0
 
 
 def main() -> int:

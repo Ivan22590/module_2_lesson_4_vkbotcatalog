@@ -6,12 +6,16 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
+LOG_PATH = BASE_DIR / "bot.log"
+
+LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 
 TOKEN_VAR = "VK_GROUP_TOKEN"
 GROUP_ID_VAR = "VK_GROUP_ID"
@@ -35,7 +39,11 @@ class Config:
 
 
 def setup_logging() -> None:
-    """Настраивает консольное логирование в UTF-8.
+    """Настраивает логирование в консоль и в файл ``bot.log`` (UTF-8).
+
+    Файл нужен, чтобы можно было посмотреть историю запуска, когда консоль
+    недоступна: туда попадают входящие сообщения, отправленные ответы
+    и все ошибки. Файл ограничен по размеру, старые копии — ``bot.log.N``.
 
     Токен в логи никогда не выводится.
     """
@@ -45,10 +53,17 @@ def setup_logging() -> None:
         except (AttributeError, OSError, ValueError):
             pass
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    formatter = logging.Formatter(LOG_FORMAT)
+
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+
+    log_file = RotatingFileHandler(
+        LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
     )
+    log_file.setFormatter(formatter)
+
+    logging.basicConfig(level=logging.INFO, handlers=[console, log_file])
 
 
 def load_config() -> Config:
